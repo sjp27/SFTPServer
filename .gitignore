@@ -72,3 +72,8 @@ Thumbs.db
 
 build*/
 CMakeFiles/
+cmake-build-debug/
+html/
+latex/
+.idea/
+.vscode/
