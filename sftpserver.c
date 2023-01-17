@@ -38,21 +38,31 @@ Typo * @see https://github.com/sjp27/sftpserver
 #include <pthread.h>
 #include <stdio.h>
 #include <dirent.h>
+#ifdef WIN32
+/*#define WIN32_CHECK_FOR_MEMORY_LEAKS*/
+#include <direct.h>
+#endif
 #include <semaphore.h>
 #include <errno.h>
+#ifdef WIN32
+#include <sys/utime.h>
+#else
 #include <utime.h>
+#endif
 #include <signal.h>
 
 #include <libssh/libssh.h>
 #include <libssh/server.h>
 #define WITH_SERVER 1 /**< Compile with SFTP server support */
 #include <libssh/sftp.h>
+#include <libssh/callbacks.h>
+
 
 #define STR(s) XSTR(s) /**< Stringification support */
 #define XSTR(s) #s /**< Stringification support*/
 
 #ifndef SSH_KEYS_DIR
-#define SSH_KEYS_DIR /etc/ssh/ /**< SSH keys directory */
+#define SSH_KEYS_DIR /etc/ssh /**< SSH keys directory */
 #endif
 
 #ifndef HOME_DIR
@@ -63,6 +73,7 @@ Typo * @see https://github.com/sjp27/sftpserver
 #define MAX_HANDLES 20 /**< Maximum handles */
 #define NUM_ENTRIES_PER_PACKET 50 /**< Maximum entries per packet for readdir */
 #define MAX_LONG_NAME_LEN (NAME_MAX + 100) /**< Maximum long name length for readdir */
+#define MAX_THREADS 10 /**< Maximum number of threads */
 
 /**
  * @brief Handle type enum
@@ -132,7 +143,7 @@ static int add_handle(int z_type, void* z_handle, const char* z_path, void* z_se
             {
                 s_handle_table[i].type = z_type;
                 s_handle_table[i].handle = z_handle;
-                s_handle_table[i].path = malloc ((strlen(z_path) + 1) * sizeof(char));
+                s_handle_table[i].path = (char *)malloc ((strlen(z_path) + 1) * sizeof(char));
                 strcpy(s_handle_table[i].path, z_path);
                 s_handle_table[i].session_id = z_session_id;
                 ret = SSH_OK;
@@ -342,7 +353,11 @@ static void clear_filexfer_attrib(struct sftp_attributes_struct* z_attr)
  * @param z_st Pointer to stat struct
  * @param z_attr Pointer to attributes struct
  */
+#ifdef WIN32
+static void stat_to_filexfer_attrib(const struct _stat* z_st, struct sftp_attributes_struct* z_attr)
+#else
 static void stat_to_filexfer_attrib(const struct stat* z_st, struct sftp_attributes_struct* z_attr)
+#endif
 {
     z_attr->flags = 0;
     z_attr->flags |= (uint32_t)SSH_FILEXFER_ATTR_SIZE;
@@ -364,7 +379,11 @@ static void stat_to_filexfer_attrib(const struct stat* z_st, struct sftp_attribu
  * @param z_long_name Pointer to long_name
  * @return Pointer to long_name
  */
+#ifdef WIN32
+char* readdir_long_name(char* z_file_name, struct _stat* z_st, char* z_long_name)
+#else
 char* readdir_long_name(char* z_file_name, struct stat* z_st, char* z_long_name)
+#endif
 {
     char tmpbuf[MAX_LONG_NAME_LEN];
     char time[50];
@@ -405,6 +424,9 @@ char* readdir_long_name(char* z_file_name, struct stat* z_st, char* z_long_name)
     }
     if(mode & 0100)
     {
+#ifdef WIN32
+        *ptr++ = '-';
+#else
         if(mode & S_ISUID)
         {
             *ptr++ = 's';
@@ -413,6 +435,7 @@ char* readdir_long_name(char* z_file_name, struct stat* z_st, char* z_long_name)
         {
             *ptr++ = 'x';
         }
+#endif
     }
     else
     {
@@ -475,7 +498,12 @@ char* readdir_long_name(char* z_file_name, struct stat* z_st, char* z_long_name)
              (int)z_st->st_uid, (int)z_st->st_gid, (int)z_st->st_size);
     strcat(z_long_name, tmpbuf);
 
+#ifdef WIN32
+    ctime_s(time, sizeof(time), &z_st->st_mtime);
+#else
     ctime_r(&z_st->st_mtime, time);
+#endif
+
     if(ptr = strchr(time,'\n'))
     {
         *ptr = '\0';
@@ -679,9 +707,17 @@ static int process_fstat(sftp_client_message z_client_message)
     FILE* fp = (FILE*)sftp_handle(z_client_message->sftp, z_client_message->handle);
     int fd = fileno(fp);
     struct sftp_attributes_struct attr;
+#ifdef WIN32
+    struct _stat st;
+#else
     struct stat st;
+#endif
 
+#ifdef WIN32
+    if(_fstat(fd, &st) == 0)
+#else
     if(fstat(fd, &st) == 0)
+#endif
     {
         stat_to_filexfer_attrib(&st, &attr);
         sftp_reply_attr(z_client_message, &attr);
@@ -706,9 +742,17 @@ static int process_lstat(sftp_client_message z_client_message)
     int ret = SSH_OK;
     const char* file_name = sftp_client_message_get_filename(z_client_message);
     struct sftp_attributes_struct attr;
+#ifdef WIN32
+    struct _stat st;
+#else
     struct stat st;
+#endif
 
+#ifdef WIN32
+    if(_stat(file_name, &st) == 0)
+#else
     if(lstat(file_name, &st) == 0)
+#endif
     {
         stat_to_filexfer_attrib(&st, &attr);
         sftp_reply_attr(z_client_message, &attr);
@@ -737,7 +781,11 @@ static int process_mkdir(sftp_client_message z_client_message)
     uint32_t permission = z_client_message->attr->permissions;
     uint32_t mode = (message_flags & (uint32_t)SSH_FILEXFER_ATTR_PERMISSIONS) ? permission & (uint32_t)07777 : 0777;
 
+#ifdef WIN32
+    if(_mkdir(dir_name) < 0)
+#else
     if(mkdir(dir_name, mode) < 0)
+#endif
     {
         status = unix_errno_to_ssh_status(errno);
         ret = SSH_ERROR;
@@ -865,7 +913,7 @@ static int process_read(sftp_client_message z_client_message)
         if(fseek(fp, z_client_message->offset, SEEK_SET) == 0)
         {
             uint32_t n;
-            char* buffer = malloc ((z_client_message->len) * sizeof(char));
+            char* buffer = (char *)malloc ((z_client_message->len) * sizeof(char));
 
             ret = SSH_OK;
 
@@ -924,12 +972,20 @@ static int process_readdir(sftp_client_message z_client_message)
             if (dentry != NULL)
             {
                 struct sftp_attributes_struct attr;
+#ifdef WIN32
+                struct _stat st;
+#else
                 struct stat st;
+#endif
                 char long_name[MAX_LONG_NAME_LEN];
 
                 strcpy(&long_path[path_length], dentry->d_name);
 
+#ifdef WIN32
+                if(_stat(long_path, &st) == 0)
+#else
                 if(stat(long_path, &st) == 0)
+#endif
                 {
                     stat_to_filexfer_attrib(&st, &attr);
                 }
@@ -979,7 +1035,11 @@ static int process_realpath(sftp_client_message z_client_message)
     {
         char long_path[PATH_MAX];
 
+#ifdef WIN32
+        if (_fullpath(long_path, path, PATH_MAX) != NULL)       
+#else
         if (realpath(path, long_path) != NULL)
+#endif
         {
             sftp_reply_name(z_client_message, long_path, NULL);
             ret = SSH_OK;
@@ -1031,13 +1091,25 @@ static int process_rename(sftp_client_message z_client_message)
     int status = SSH_FX_FAILURE;
     const char* old_file_name = sftp_client_message_get_filename(z_client_message);
     const char* new_file_name = sftp_client_message_get_data(z_client_message);
+#ifdef WIN32
+    struct _stat st;
+#else
     struct stat st;
+#endif
 
     /* Check old file name exists */
+#ifdef WIN32
+    if(_stat(old_file_name, &st) == 0)
+#else
     if(lstat(old_file_name, &st) == 0)
+#endif
     {
         /* Check new file name does not already exist */
+#ifdef WIN32
+        if(_stat(new_file_name, &st) == -1)
+#else
         if(stat(new_file_name, &st) == -1)
+#endif
         {
             if(rename(old_file_name, new_file_name) == 0)
             {
@@ -1105,16 +1177,24 @@ static int process_setstat(sftp_client_message z_client_message)
 
     if(z_client_message->attr->flags & (uint32_t)SSH_FILEXFER_ATTR_SIZE)
     {
+#ifdef WIN32
+        ret = SSH_ERROR;
+#else
         if(truncate(file_name, z_client_message->attr->size) == -1)
         {
             ret = SSH_ERROR;
             status = unix_errno_to_ssh_status(errno);
         }
+#endif
     }
 
     if(z_client_message->attr->flags & (uint32_t)SSH_FILEXFER_ATTR_PERMISSIONS)
     {
+#ifdef WIN32
+        ret = SSH_ERROR;
+#else
         if(chmod(file_name, z_client_message->attr->permissions & (uint32_t)07777) == -1)
+#endif
         {
             ret = SSH_ERROR;
             status = unix_errno_to_ssh_status(errno);
@@ -1137,11 +1217,15 @@ static int process_setstat(sftp_client_message z_client_message)
 
     if(z_client_message->attr->flags & (uint32_t)SSH_FILEXFER_ATTR_UIDGID)
     {
+#ifdef WIN32
+        ret = SSH_ERROR;
+#else
         if(chown(file_name, z_client_message->attr->uid, z_client_message->attr->gid) == -1)
         {
             ret = SSH_ERROR;
             status = unix_errno_to_ssh_status(errno);
         }
+#endif
     }
 
     sftp_reply_status(z_client_message, status, NULL);
@@ -1159,9 +1243,17 @@ static int process_stat(sftp_client_message z_client_message)
     int ret = SSH_OK;
     const char* file_name = sftp_client_message_get_filename(z_client_message);
     struct sftp_attributes_struct attr;
+#ifdef WIN32
+    struct _stat st;
+#else
     struct stat st;
+#endif
 
+#ifdef WIN32
+    if(_stat(file_name, &st) == 0)
+#else
     if(stat(file_name, &st) == 0)
+#endif
     {
         stat_to_filexfer_attrib(&st, &attr);
         sftp_reply_attr(z_client_message, &attr);
@@ -1212,6 +1304,8 @@ static int process_write(sftp_client_message z_client_message)
     return(ret);
 }
 
+volatile sig_atomic_t run = 1; /**< Run flag */
+
 /**
  * @brief Process SFTP commands
  * @param z_sftp_sn - Pointer to sftp session
@@ -1220,7 +1314,7 @@ static void process_sftp_commands(sftp_session z_sftp_sn)
 {
     int status = SSH_OK;
 
-    while(1)
+    while(run == 1)
     {
         int client_message_type;
 
@@ -1349,6 +1443,8 @@ static void process_sftp_commands(sftp_session z_sftp_sn)
     }
 }
 
+volatile sig_atomic_t num_threads = 0; /**< Number of threads */
+
 /**
  * @brief Worker thread
  * @param z_session - Pointer to ssh session
@@ -1408,27 +1504,27 @@ static void* worker_thread(void* z_session)
 
         process_sftp_commands(sftp_sn);
 
-        free_handles(sftp_sn);
 
     }while(0);
 
     if(sftp_sn != NULL)
     {
+        free_handles(sftp_sn);
         sftp_free(sftp_sn);
     }
 
     ssh_disconnect(session);
     ssh_free(session);
 
-    pthread_exit(NULL);
-}
+    num_threads--;
 
-volatile sig_atomic_t run = 1; /**< Run flag */
+    return(NULL);
+}
 
 /**
  * @brief sigterm handler
  */
-void sigterm_handler()
+void sigterm_handler(int signal)
 {
     run = 0;
 }
@@ -1441,15 +1537,24 @@ int main()
 {
     int ret = SSH_ERROR;
     ssh_bind sshbind = NULL;
+#ifndef WIN32
     struct sigaction action;
+#endif
+    ssh_threads_set_callbacks(ssh_threads_get_pthread());
+
+    ssh_init();
 
     printf("Starting sftpserver on port %s\n", BINDPORT);
 
+#ifdef WIN32
+    /* Catch SIGBREAK */
+    signal(SIGBREAK, sigterm_handler);
+#else
     /* Catch SIGTERM */
     memset(&action, 0, sizeof(struct sigaction));
     action.sa_handler = sigterm_handler;
     sigaction(SIGTERM, &action, NULL);
-
+#endif
     do
     {
         if(chdir(STR(HOME_DIR)) == -1)
@@ -1464,12 +1569,12 @@ int main()
             break;
         }
 
-        /*if(ssh_bind_options_set(sshbind, SSH_BIND_OPTIONS_DSAKEY, STR(SSH_KEYS_DIR) "ssh_host_dsa_key") < 0)
+        /*if(ssh_bind_options_set(sshbind, SSH_BIND_OPTIONS_DSAKEY, STR(SSH_KEYS_DIR) "/ssh_host_dsa_key") < 0)
         {
             break;
         }*/
 
-        if(ssh_bind_options_set(sshbind, SSH_BIND_OPTIONS_RSAKEY, STR(SSH_KEYS_DIR) "ssh_host_rsa_key") < 0)
+        if(ssh_bind_options_set(sshbind, SSH_BIND_OPTIONS_RSAKEY, STR(SSH_KEYS_DIR) "/ssh_host_rsa_key") < 0)
         {
             break;
         }
@@ -1492,56 +1597,88 @@ int main()
             ssh_session session;
             pthread_attr_t tattr;
             pthread_t thread;
+            int error = 1; /* Assume error for now */
+            ret = SSH_ERROR;
 
             session = ssh_new();
 
-            if(session == NULL)
+            if(session != NULL)
             {
-                printf("Error ssh_new\n");
-                continue;
-            }
-
-            if(ssh_bind_accept(sshbind, session) == SSH_OK)
-            {
-                /* Assume error for now */
-                run = 0;
-                ret = SSH_ERROR;
-
-                if(pthread_attr_init(&tattr) == 0)
+                if(ssh_bind_accept(sshbind, session) == SSH_OK)
                 {
-                    if(pthread_attr_setdetachstate(&tattr,PTHREAD_CREATE_DETACHED) == 0)
+                    if(num_threads < MAX_THREADS)
                     {
-                        if(pthread_create(&thread, &tattr, worker_thread, session) == 0)
+                        if(pthread_attr_init(&tattr) == 0)
                         {
-                            /* All OK */
-                            run = 1;
-                            ret = SSH_OK;
+                            if(pthread_attr_setdetachstate(&tattr,PTHREAD_CREATE_DETACHED) == 0)
+                            {
+                                if(pthread_create(&thread, &tattr, worker_thread, session) == 0)
+                                {
+                                    /* All OK */
+                                    error = 0;
+                                    ret = SSH_OK;
+                                    num_threads++;
+                                }
+                            }
+                            
+                            if(pthread_attr_destroy(&tattr) != 0)
+                            {
+                                /* Failed to free attributes */
+                                printf("Error pthread_attr_destroy\n");
+                            }
                         }
                     }
-                    
-                    if(pthread_attr_destroy(&tattr) != 0)
+                    else
                     {
-                        /* Failed to free attributes */
-                        run = 0;
-                        ret = SSH_ERROR;
+                        printf("No free threads\n");
+                        ssh_disconnect(session);
+                        ssh_free(session);
+                        error = 0;
+                        ret = SSH_OK;
                     }
+                }
+                else
+                {
+                    printf("Error ssh_bind_accept: %s\n",ssh_get_error(sshbind));
+                }
+                
+                if(error)
+                {
+                    ssh_disconnect(session);
+                    ssh_free(session);
+                    run = 0;
                 }
             }
             else
             {
-                printf("Error ssh_bind_accept: %s\n",ssh_get_error(sshbind));
+                printf("Error ssh_new\n");
+                run = 0;
             }
         }
     }while(0);
 
-    printf("Stopping sftpserver\n");
-
     ssh_bind_free(sshbind);
+
+#ifdef WIN32_CHECK_FOR_MEMORY_LEAKS
+    while(num_threads)
+    {
+        struct timespec t = {5, 0};
+        printf("Number of threads running %d\n", num_threads); 
+        pthread_delay_np(&t);
+    }
+#endif
 
     if(ssh_finalize() < 0)
     {
-        printf("SSH finalize failed");
+        printf("SSH finalize failed\n");
     }
+
+    printf("Sftpserver stopped\n");
+
+#ifdef WIN32_CHECK_FOR_MEMORY_LEAKS
+    _CrtSetReportMode(_CRT_WARN, _CRTDBG_MODE_DEBUG);   
+    _CrtDumpMemoryLeaks();
+#endif
 
     return ret;
 }
