@@ -334,6 +334,35 @@ static int unix_errno_to_ssh_status(int z_errno)
 }
 
 /**
+ * @brief Convert to unix format path
+ * @param z_path Pointer to path to convert
+ * @return Pointer to unix format path
+ */
+static char* convert_to_unix_path(char* z_path)
+{
+    char* path = strchr(z_path, ':');
+    char* p;
+
+    if(path != NULL)
+    {
+        path++; /* Skip ':' char */
+    }
+    else
+    {
+        path = z_path;
+    }
+
+    p = path;
+
+    while(p = strchr(p, '\\'))
+    {
+        *p = '/';
+    }
+
+    return(path);
+}
+
+/**
  * @brief Clear filexfer attrib
  * @param z_attr Pointer to attributes struct
  */
@@ -807,34 +836,34 @@ static int process_open(sftp_client_message z_client_message)
     const char* file_name = sftp_client_message_get_filename(z_client_message);
     uint32_t message_flags = z_client_message->flags;
     FILE* fp = NULL;
-    char mode[3];
+    char mode[4];
 
     if(( (message_flags & (uint32_t)SSH_FXF_READ) == SSH_FXF_READ) &&
        ( (message_flags & (uint32_t)SSH_FXF_WRITE) == SSH_FXF_WRITE))
     {
         if((message_flags & (uint32_t)SSH_FXF_CREAT) == SSH_FXF_CREAT)
         {
-            strcpy(mode, "w+");
+            strcpy(mode, "w+b");
         }
         else
         {
-            strcpy(mode, "r+");
+            strcpy(mode, "r+b");
         }
     }
     else if((message_flags & (uint32_t)SSH_FXF_READ) == SSH_FXF_READ)
     {
         if((message_flags & (uint32_t)SSH_FXF_APPEND) == SSH_FXF_APPEND)
         {
-            strcpy(mode, "a+");
+            strcpy(mode, "a+b");
         }
         else
         {
-            strcpy(mode, "r");
+            strcpy(mode, "rb");
         }
     }
     else if((message_flags & (uint32_t)SSH_FXF_WRITE) == SSH_FXF_WRITE)
     {
-        strcpy(mode, "w");
+        strcpy(mode, "wb");
     }
 
     fp = fopen(file_name, mode);
@@ -982,7 +1011,7 @@ static int process_readdir(sftp_client_message z_client_message)
                 strcpy(&long_path[path_length], dentry->d_name);
 
 #ifdef WIN32
-                if(_stat(long_path, &st) == 0)
+                if(_stat(convert_to_unix_path(long_path), &st) == 0)
 #else
                 if(stat(long_path, &st) == 0)
 #endif
@@ -1027,7 +1056,6 @@ static int process_readdir(sftp_client_message z_client_message)
  */
 static int process_realpath(sftp_client_message z_client_message)
 {
-    int ret = SSH_ERROR;
     int status = SSH_FX_FAILURE;
     const char* path = sftp_client_message_get_filename(z_client_message);
 
@@ -1037,25 +1065,28 @@ static int process_realpath(sftp_client_message z_client_message)
 
 #ifdef WIN32
         if (_fullpath(long_path, path, PATH_MAX) != NULL)       
+        {
+            sftp_reply_name(z_client_message, convert_to_unix_path(long_path), NULL);
+        }
+        else
+        {
+            status = ENOENT;
+            sftp_reply_status(z_client_message, status, NULL);
+        }
 #else
         if (realpath(path, long_path) != NULL)
-#endif
         {
             sftp_reply_name(z_client_message, long_path, NULL);
-            ret = SSH_OK;
         }
         else
         {
             status = unix_errno_to_ssh_status(errno);
+            sftp_reply_status(z_client_message, status, NULL);
         }
+#endif
     }
 
-    if(ret == SSH_ERROR)
-    {
-        sftp_reply_status(z_client_message, status, NULL);
-    }
-
-    return(ret);
+    return(SSH_OK);
 }
 
 /**
@@ -1281,10 +1312,10 @@ static int process_write(sftp_client_message z_client_message)
     if(fp != NULL)
     {
         unsigned long n;
-        unsigned long len = strlen(ssh_string_get_char(z_client_message->data));
 
         fseek(fp, z_client_message->offset, SEEK_SET);
-        n = fwrite(ssh_string_get_char(z_client_message->data), sizeof(char), len, fp);
+
+        n = fwrite(ssh_string_data(z_client_message->data), sizeof(char), ssh_string_len(z_client_message->data), fp);
 
         if(n > 0)
         {
